@@ -1,6 +1,6 @@
 /* http_load - multiprocessing http test client
 **
-** Copyright © 1998,1999,2001 by Jef Poskanzer <jef@mail.acme.com>.
+** Copyright ? 1998,1999,2001,2016 by Jef Poskanzer <jef@mail.acme.com>.
 ** All rights reserved.
 **
 ** Redistribution and use in source and binary forms, with or without
@@ -25,8 +25,8 @@
 ** SUCH DAMAGE.
 */
 
-#include <unistd.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <string.h>
 #include <fcntl.h>
@@ -39,6 +39,7 @@
 #include <netdb.h>
 #include <errno.h>
 #include <signal.h>
+#include <time.h>
 
 #ifdef USE_SSL
 #include <openssl/ssl.h>
@@ -58,7 +59,7 @@
 #define min(a,b) ((a)<=(b)?(a):(b))
 
 /* How long a connection can stay idle before we give up on it. */
-#define IDLE_SECS 300
+#define IDLE_SECS 60
 
 /* Default max bytes/second in throttle mode. */
 #define THROTTLE 3360
@@ -76,9 +77,9 @@ typedef struct {
     char* hostname;
     unsigned short port;
 #ifdef USE_IPV6
-    struct sockaddr_in6 sa;
+    struct sockaddr_in6 sa_in;
 #else /* USE_IPV6 */
-    struct sockaddr_in sa;
+    struct sockaddr_in sa_in;
 #endif /* USE_IPV6 */
     int sa_len, sock_family, sock_type, sock_protocol;
     char* filename;
@@ -92,7 +93,7 @@ static int num_urls, max_urls;
 
 typedef struct {
     char* str;
-    struct sockaddr_in sa;
+    struct sockaddr_in sa_in;
     } sip;
 static sip* sips;
 static int num_sips, max_sips;
@@ -105,7 +106,7 @@ static int num_sips, max_sips;
 
 typedef struct {
     int url_num;
-    struct sockaddr_in sa;
+    struct sockaddr_in sa_in;
     int sa_len;
     int conn_fd;
 #ifdef USE_SSL
@@ -163,7 +164,7 @@ static int http_status_counts[1000];	/* room for all three-digit statuses */
 #define HDST_CONTENT_LENGTH_COLON_WHITESPACE_NUM 36
 
 static char* argv0;
-static int do_checksum, do_throttle, do_verbose, do_jitter, do_proxy, do_bytesize;
+static int do_checksum, do_throttle, do_verbose, do_jitter, do_proxy;
 static float throttle;
 static int idle_secs;
 static char* proxy_hostname;
@@ -181,10 +182,12 @@ static long start_interval, low_interval, high_interval, range_interval;
 #ifdef USE_SSL
 static SSL_CTX* ssl_ctx = (SSL_CTX*) 0;
 static char* cipher = (char*) 0;
+static char* sess_in = (char*) 0;
+static int g_tls13_enable = 0;
 #endif
 
 /* Forwards. */
-static void usage( void );
+static void usage( void ) __attribute__ ((noreturn));
 static void read_url_file( char* url_file );
 static void lookup_address( int url_num );
 static void read_sip_file( char* sip_file );
@@ -198,8 +201,8 @@ static void close_connection( int cnum );
 static void progress_report( ClientData client_data, struct timeval* nowP );
 static void start_timer( ClientData client_data, struct timeval* nowP );
 static void end_timer( ClientData client_data, struct timeval* nowP );
-static void finish( struct timeval* nowP );
-static long long delta_timeval( struct timeval* start, struct timeval* finish );
+static void finish( struct timeval* nowP ) __attribute__ ((noreturn));
+static long long delta_timeval( struct timeval* start, struct timeval* end );
 static void* malloc_check( size_t size );
 static void* realloc_check( void* ptr, size_t size );
 static char* strdup_check( char* str );
@@ -251,7 +254,7 @@ main( int argc, char** argv )
     /* Parse args. */
     argv0 = argv[0];
     argn = 1;
-    do_checksum = do_throttle = do_verbose = do_jitter = do_proxy = do_bytesize = 0;
+    do_checksum = do_throttle = do_verbose = do_jitter = do_proxy = 0;
     throttle = THROTTLE;
     sip_file = (char*) 0;
     idle_secs = IDLE_SECS;
@@ -261,8 +264,6 @@ main( int argc, char** argv )
 	{
 	if ( strncmp( argv[argn], "-checksum", strlen( argv[argn] ) ) == 0 )
 	    do_checksum = 1;
-        else if ( strncmp( argv[argn], "-bytesize", strlen( argv[argn] ) ) == 0 )
-            do_bytesize = 1;
 	else if ( strncmp( argv[argn], "-throttle", strlen( argv[argn] ) ) == 0 )
 	    do_throttle = 1;
 	else if ( strncmp( argv[argn], "-Throttle", strlen( argv[argn] ) ) == 0 && argn + 1 < argc )
@@ -345,6 +346,14 @@ main( int argc, char** argv )
 	    else if ( strcasecmp( cipher, "paranoid" ) == 0 )
 		cipher = "AES256-SHA";
 	    }
+	else if ( strncmp( argv[argn], "-tls1_3", strlen( argv[argn] ) ) == 0)
+        {
+            g_tls13_enable = 1;
+        }
+	else if ( strncmp( argv[argn], "-sess_in", strlen( argv[argn] ) ) == 0 && argn + 1 < argc )
+        {
+            sess_in = argv[++argn];
+        }
 #endif /* USE_SSL */
 	else if ( strncmp( argv[argn], "-proxy", strlen( argv[argn] ) ) == 0 && argn + 1 < argc )
 	    {
@@ -509,10 +518,10 @@ static void
 usage( void )
     {
     (void) fprintf( stderr,
-    "usage:  %s [-checksum|-bytesize] [-throttle] [-proxy host:port] [-verbose] [-timeout secs] [-sip sip_file]\n", argv0 );
+	"usage:  %s [-checksum] [-throttle] [-proxy host:port] [-verbose] [-timeout secs] [-sip sip_file]\n", argv0 );
 #ifdef USE_SSL
     (void) fprintf( stderr,
-	"            [-cipher str]\n" );
+	"            [-cipher str] [-sess_in str] [-tls1_3]\n" );
 #endif /* USE_SSL */
     (void) fprintf( stderr,
 	"            -parallel N | -rate N [-jitter]\n" );
@@ -549,7 +558,7 @@ read_url_file( char* url_file )
 	exit( 1 );
 	}
 
-    max_urls = 100000;
+    max_urls = 100;
     urls = (url*) malloc_check( max_urls * sizeof(url) );
     num_urls = 0;
     while ( fgets( line, sizeof(line), fp ) != (char*) 0 )
@@ -640,8 +649,8 @@ lookup_address( int url_num )
     struct hostent *he;
 #endif /* USE_IPV6 */
 
-    urls[url_num].sa_len = sizeof(urls[url_num].sa);
-    (void) memset( (void*) &urls[url_num].sa, 0, urls[url_num].sa_len );
+    urls[url_num].sa_len = sizeof(urls[url_num].sa_in);
+    (void) memset( (void*) &urls[url_num].sa_in, 0, urls[url_num].sa_len );
 
     if ( do_proxy )
 	{
@@ -689,11 +698,11 @@ lookup_address( int url_num )
     /* If there's an IPv4 address, use that, otherwise try IPv6. */
     if ( aiv4 != (struct addrinfo*) 0 )
 	{
-	if ( sizeof(urls[url_num].sa) < aiv4->ai_addrlen )
+	if ( sizeof(urls[url_num].sa_in) < aiv4->ai_addrlen )
 	    {
 	    (void) fprintf(
 		stderr, "%s - sockaddr too small (%lu < %lu)\n", hostname,
-		(unsigned long) sizeof(urls[url_num].sa),
+		(unsigned long) sizeof(urls[url_num].sa_in),
 		(unsigned long) aiv4->ai_addrlen );
 	    exit( 1 );
 	    }
@@ -701,17 +710,17 @@ lookup_address( int url_num )
 	urls[url_num].sock_type = aiv4->ai_socktype;
 	urls[url_num].sock_protocol = aiv4->ai_protocol;
 	urls[url_num].sa_len = aiv4->ai_addrlen;
-	(void) memmove( &urls[url_num].sa, aiv4->ai_addr, aiv4->ai_addrlen );
+	(void) memmove( &urls[url_num].sa_in, aiv4->ai_addr, aiv4->ai_addrlen );
 	freeaddrinfo( ai );
 	return;
 	}
     if ( aiv6 != (struct addrinfo*) 0 )
 	{
-	if ( sizeof(urls[url_num].sa) < aiv6->ai_addrlen )
+	if ( sizeof(urls[url_num].sa_in) < aiv6->ai_addrlen )
 	    {
 	    (void) fprintf(
 		stderr, "%s - sockaddr too small (%lu < %lu)\n", hostname,
-		(unsigned long) sizeof(urls[url_num].sa),
+		(unsigned long) sizeof(urls[url_num].sa_in),
 		(unsigned long) aiv6->ai_addrlen );
 	    exit( 1 );
 	    }
@@ -719,7 +728,7 @@ lookup_address( int url_num )
 	urls[url_num].sock_type = aiv6->ai_socktype;
 	urls[url_num].sock_protocol = aiv6->ai_protocol;
 	urls[url_num].sa_len = aiv6->ai_addrlen;
-	(void) memmove( &urls[url_num].sa, aiv6->ai_addr, aiv6->ai_addrlen );
+	(void) memmove( &urls[url_num].sa_in, aiv6->ai_addr, aiv6->ai_addrlen );
 	freeaddrinfo( ai );
 	return;
 	}
@@ -736,12 +745,12 @@ lookup_address( int url_num )
 	(void) fprintf( stderr, "%s: unknown host - %s\n", argv0, hostname );
 	exit( 1 );
 	}
-    urls[url_num].sock_family = urls[url_num].sa.sin_family = he->h_addrtype;
+    urls[url_num].sock_family = urls[url_num].sa_in.sin_family = he->h_addrtype;
     urls[url_num].sock_type = SOCK_STREAM;
     urls[url_num].sock_protocol = 0;
-    urls[url_num].sa_len = sizeof(urls[url_num].sa);
-    (void) memmove( &urls[url_num].sa.sin_addr, he->h_addr, he->h_length );
-    urls[url_num].sa.sin_port = htons( port );
+    urls[url_num].sa_len = sizeof(urls[url_num].sa_in);
+    (void) memmove( &urls[url_num].sa_in.sin_addr, he->h_addr, he->h_length );
+    urls[url_num].sa_in.sin_port = htons( port );
 
 #endif /* USE_IPV6 */
 
@@ -779,8 +788,9 @@ read_sip_file( char* sip_file )
 
 	/* Add to table. */
 	sips[num_sips].str = strdup_check( line );
-	(void) memset( (void*) &sips[num_sips].sa, 0, sizeof(sips[num_sips].sa) );
-	if ( ! inet_aton( sips[num_sips].str, &sips[num_sips].sa.sin_addr ) )
+	(void) memset( (void*) &sips[num_sips].sa_in, 0, sizeof(sips[num_sips].sa_in) );
+	sips[num_sips].sa_in.sin_family = AF_INET;
+	if ( ! inet_aton( sips[num_sips].str, &sips[num_sips].sa_in.sin_addr ) )
 	    {
 	    (void) fprintf(
 		stderr, "%s: cannot convert source IP address %s\n",
@@ -872,8 +882,8 @@ start_socket( int url_num, int cnum, struct timeval* nowP )
 	sip_num = ( (unsigned long) random() ) % ( (unsigned int) num_sips );
 	if ( bind(
 		 connections[cnum].conn_fd,
-		 (struct sockaddr*) &sips[sip_num].sa,
-	         sizeof(sips[sip_num].sa) ) < 0 )
+		 (struct sockaddr*) &sips[sip_num].sa_in,
+	         sizeof(sips[sip_num].sa_in) ) < 0 )
 	    {
 	    perror( "binding local address" );
 	    (void) close( connections[cnum].conn_fd );
@@ -884,12 +894,12 @@ start_socket( int url_num, int cnum, struct timeval* nowP )
     /* Connect to the host. */
     connections[cnum].sa_len = urls[url_num].sa_len;
     (void) memmove(
-	(void*) &connections[cnum].sa, (void*) &urls[url_num].sa,
+	(void*) &connections[cnum].sa_in, (void*) &urls[url_num].sa_in,
 	urls[url_num].sa_len );
     connections[cnum].connect_at = *nowP;
     if ( connect(
 	     connections[cnum].conn_fd,
-	     (struct sockaddr*) &connections[cnum].sa,
+	     (struct sockaddr*) &connections[cnum].sa_in,
 	     connections[cnum].sa_len ) < 0 )
 	{
 	if ( errno == EINPROGRESS )
@@ -922,17 +932,17 @@ handle_connect( int cnum, struct timeval* nowP, int double_check )
     if ( double_check )
 	{
 	/* Check to make sure the non-blocking connect succeeded. */
-	int err, errlen;
+	int err;
+	socklen_t errlen;
 
 	if ( connect(
 		 connections[cnum].conn_fd,
-		 (struct sockaddr*) &connections[cnum].sa,
+		 (struct sockaddr*) &connections[cnum].sa_in,
 		 connections[cnum].sa_len ) < 0 )
 	    {
 	    switch ( errno )
 		{
 		case EISCONN:
-                case EALREADY:
 		/* Ok! */
 		break;
 		case EINVAL:
@@ -948,9 +958,9 @@ handle_connect( int cnum, struct timeval* nowP, int double_check )
 		close_connection( cnum );
 		return;
 		default:
-                    (void) printf("-1\t-1\t%s\t(%s)\n", urls[url_num].url_str, strerror( errno ));
-                    close_connection( cnum );
-                    return;
+		perror( urls[url_num].url_str );
+		close_connection( cnum );
+		return;
 		}
 	    }
 	}
@@ -967,6 +977,18 @@ handle_connect( int cnum, struct timeval* nowP, int double_check )
 	    ssl_ctx = SSL_CTX_new( SSLv23_client_method() );
 	    if ( cipher != (char*) 0 )
 		{
+        if (g_tls13_enable) 
+            {
+            SSL_CTX_set_min_proto_version(ssl_ctx, TLS1_3_VERSION);
+            SSL_CTX_set_max_proto_version(ssl_ctx, TLS1_3_VERSION);
+            }
+		SSL_CTX_set_options( ssl_ctx, SSL_OP_NO_SSLv2|SSL_OP_NO_SSLv3 );
+        if (g_tls13_enable) 
+            {
+		    SSL_CTX_set_ciphersuites( ssl_ctx, cipher  );
+            }
+        else 
+        {
 		if ( ! SSL_CTX_set_cipher_list( ssl_ctx, cipher ) )
 		    {
 		    (void) fprintf(
@@ -976,20 +998,51 @@ handle_connect( int cnum, struct timeval* nowP, int double_check )
 		    return;
 		    }
 		}
+        }
 	    }
 	if ( ! RAND_status() )
 	    {
-	    unsigned char bytes[1024];
+	    unsigned char random_bytes[1024];
 	    int i;
-	    for ( i = 0; i < sizeof(bytes); ++i )
-		bytes[i] = random() % 0xff;
-	    RAND_seed( bytes, sizeof(bytes) );
+	    for ( i = 0; i < sizeof(random_bytes); ++i )
+		random_bytes[i] = random() % 0xff;
+	    RAND_seed( random_bytes, sizeof(random_bytes) );
 	    }
 	flags = fcntl( connections[cnum].conn_fd, F_GETFL, 0 );
 	if ( flags != -1 )
 	    (void) fcntl(
 		connections[cnum].conn_fd, F_SETFL, flags & ~ (int) O_NDELAY );
 	connections[cnum].ssl = SSL_new( ssl_ctx );
+    if (sess_in != NULL) {
+        SSL_SESSION *sess;
+        SSL *con = connections[cnum].ssl;
+        BIO *stmp = BIO_new_file(sess_in, "r");
+        if (stmp == NULL) {
+		    (void) fprintf(
+			stderr, "Can't open session file %s\n", sess_in);
+		    ERR_print_errors_fp( stderr );
+		    close_connection( cnum );
+		    return;
+        }
+        sess = PEM_read_bio_SSL_SESSION(stmp, NULL, 0, NULL);
+        BIO_free(stmp);
+        if (sess == NULL) {
+		    (void) fprintf(
+			stderr, "Can't open session file %s\n", sess_in);
+		    ERR_print_errors_fp( stderr );
+		    close_connection( cnum );
+		    return;
+        }
+        if (!SSL_set_session(con, sess)) {
+		    (void) fprintf(
+			stderr, "Can't set session\n");
+		    ERR_print_errors_fp( stderr );
+		    close_connection( cnum );
+		    return;
+        }
+
+        SSL_SESSION_free(sess);
+    }
 	SSL_set_fd( connections[cnum].ssl, connections[cnum].conn_fd );
 	r = SSL_connect( connections[cnum].ssl );
 	if ( r <= 0 )
@@ -1028,7 +1081,7 @@ handle_connect( int cnum, struct timeval* nowP, int double_check )
 	&buf[bytes], sizeof(buf) - bytes, "Host: %s\r\n",
 	urls[url_num].hostname );
     bytes += snprintf(
-	&buf[bytes], sizeof(buf) - bytes, "User-Agent: %s\r\n", VERSION );
+	&buf[bytes], sizeof(buf) - bytes, "User-Agent: %s\r\n", HTTP_LOAD_VERSION );
     bytes += snprintf( &buf[bytes], sizeof(buf) - bytes, "\r\n" );
 
     /* Send the request. */
@@ -1059,7 +1112,7 @@ handle_read( int cnum, struct timeval* nowP )
     int bytes_to_read, bytes_read, bytes_handled;
     float elapsed;
     ClientData client_data;
-    register long checksum;
+    long checksum;
 
     tmr_reset( nowP, connections[cnum].idle_timer );
 
@@ -1680,7 +1733,6 @@ close_connection( int cnum )
 	max_response_usecs = max( max_response_usecs, response_usecs );
 	min_response_usecs = min( min_response_usecs, response_usecs );
 	++responses_completed;
-        printf("%d\t%lld\t%s\n", connections[cnum].http_status, response_usecs, urls[connections[cnum].url_num].url_str);
 	}
     if ( connections[cnum].http_status >= 0 && connections[cnum].http_status <= 999 )
 	++http_status_counts[connections[cnum].http_status];
@@ -1703,7 +1755,7 @@ close_connection( int cnum )
 		}
 	    }
 	}
-    else if ( do_bytesize )
+    else
 	{
 	if ( ! urls[url_num].got_bytes )
 	    {
@@ -1815,10 +1867,10 @@ finish( struct timeval* nowP )
 
 
 static long long
-delta_timeval( struct timeval* start, struct timeval* finish )
+delta_timeval( struct timeval* start, struct timeval* end )
     {
-    long long delta_secs = finish->tv_sec - start->tv_sec;
-    long long delta_usecs = finish->tv_usec - start->tv_usec;
+    long long delta_secs = end->tv_sec - start->tv_sec;
+    long long delta_usecs = end->tv_usec - start->tv_usec;
     return delta_secs * (long long) 1000000L + delta_usecs;
     }
 
